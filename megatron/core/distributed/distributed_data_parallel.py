@@ -3,6 +3,7 @@
 import logging
 import weakref
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Optional
 
 import torch
@@ -85,6 +86,8 @@ class DistributedDataParallel(_BaseDataParallel):
         full_param_layout: Optional[FullParamLayout] = None,
     ):
         super().__init__(config=config, module=module)
+        if getattr(config, 'ddp_cpu_staging', False):
+            ddp_config = replace(ddp_config, ddp_cpu_staging=True)
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 

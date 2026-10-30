@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import copy
+import gc
 import logging
 import warnings
 from collections import defaultdict
@@ -712,6 +713,7 @@ def _get_megatron_optimizer_based_on_param_groups(
         else:
             optimizer = Float16OptimizerWithFloat16Params(*optimizer_args)
             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+        del optimizer_args
     else:
         # FP32 optimizer.
         optimizer = FP32Optimizer(optimizer, config, init_state_fn)
@@ -723,6 +725,10 @@ def _get_megatron_optimizer_based_on_param_groups(
         tp_group = pg_collection.tp
     # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
     setattr(optimizer, 'tp_group', tp_group)
+
+    if config.optimizer_cpu_offload and config.use_distributed_optimizer:
+        # Sub-optimizer hooks can retain obsolete full-size CPU copies in reference cycles.
+        gc.collect()
 
     return optimizer
 

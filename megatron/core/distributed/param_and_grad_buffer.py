@@ -1113,6 +1113,28 @@ class _ParamAndGradBuffer:
         self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
 
+        if (
+            ddp_config.ddp_cpu_staging
+            and ddp_config.use_distributed_optimizer
+            and param_dtype == torch.bfloat16
+        ):
+            staged_bytes = 0
+            for param, _ in params_with_names:
+                if (
+                    param.is_cuda
+                    and param.dtype == torch.bfloat16
+                    and not is_grouped_tensor(param)
+                    and not is_float8tensor(param)
+                    and not is_nvfp4tensor(param)
+                ):
+                    if param.data._base is not None:
+                        raise ValueError('DDP CPU staging requires viewless parameters')
+                    staged_bytes += param.numel() * param.element_size()
+                    param.data = param.detach().to('cpu')
+            if staged_bytes:
+                torch.cuda.empty_cache()
+                logger.info('DDP initialization staged %s BF16 bytes on CPU', staged_bytes)
+
         # Check that params are unique.
         unique_params = set()
         for param, _ in params_with_names:

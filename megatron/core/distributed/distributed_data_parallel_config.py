@@ -31,6 +31,9 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
+    ddp_cpu_staging: bool = False
+    """Stage plain BF16 CUDA parameters on CPU before allocating contiguous DDP buffers."""
+
     disable_grad_buffers_cpu_backup: bool = False
     """If true, allocate DDP gradient buffers in a torch_memory_saver region without CPU backup."""
 

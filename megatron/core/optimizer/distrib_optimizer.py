@@ -352,6 +352,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         return local_param_group_map, group_ranges
 
     @classmethod
+    @torch.no_grad()
     def _build_model_and_main_param_groups(
         cls,
         gbuf_ranges: List[Dict],

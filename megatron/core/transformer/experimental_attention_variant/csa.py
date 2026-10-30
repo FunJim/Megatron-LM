@@ -651,7 +651,7 @@ def _apply_rope(
 # ---------------------------------------------------------------------------
 
 
-def unfused_compressed_sparse_attn(
+def _unfused_compressed_sparse_attn(
     query: torch.Tensor,
     kv_full: torch.Tensor,
     attn_sink: torch.Tensor,
@@ -711,10 +711,9 @@ def unfused_compressed_sparse_attn(
     rows, np_, hn = q_flat.shape
 
     safe_indices = global_indices.clamp(min=0).long()
-    safe_indices_exp = safe_indices.unsqueeze(-1).expand(-1, -1, hn)
-    kv_gathered = torch.gather(
-        kv_flat.unsqueeze(0).expand(rows, -1, -1), dim=1, index=safe_indices_exp
-    )  # (rows, topk, hn)
+    kv_gathered = kv_flat.index_select(0, safe_indices.reshape(-1)).reshape(
+        rows, safe_indices.shape[-1], hn
+    )
 
     q_f = q_flat.float()
     kv_g = kv_gathered.float()
@@ -738,6 +737,66 @@ def unfused_compressed_sparse_attn(
     if is_thd:
         return output.reshape(rows, np_ * hn)
     return output.reshape(b, sq, np_ * hn).permute(1, 0, 2).contiguous()
+
+
+class _ChunkedSparseAttention(torch.autograd.Function):
+    """Bound THD intermediates and recompute query chunks during backward."""
+
+    @staticmethod
+    def forward(ctx, query, kv, sink, indices, scale, chunk_size):
+        ctx.save_for_backward(query, kv, sink, indices)
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        rows, heads, width = query.shape
+        output = query.new_empty(rows, heads * width)
+        for start in range(0, rows, chunk_size):
+            end = min(start + chunk_size, rows)
+            output[start:end] = _unfused_compressed_sparse_attn(
+                query[start:end], kv, sink, indices[start:end], scale
+            )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        query, kv, sink, indices = ctx.saved_tensors
+        query_grad = torch.empty_like(query)
+        kv_grad = torch.zeros_like(kv, dtype=torch.float32)
+        sink_grad = torch.zeros_like(sink, dtype=torch.float32)
+        for start in range(0, query.shape[0], ctx.chunk_size):
+            end = min(start + ctx.chunk_size, query.shape[0])
+            with torch.enable_grad():
+                q = query[start:end].detach().requires_grad_()
+                k = kv.detach().requires_grad_()
+                s = sink.detach().requires_grad_()
+                output = _unfused_compressed_sparse_attn(q, k, s, indices[start:end], ctx.scale)
+                dq, dk, ds = torch.autograd.grad(output, (q, k, s), grad_output[start:end])
+            query_grad[start:end] = dq
+            kv_grad.add_(dk.float())
+            sink_grad.add_(ds.float())
+        return query_grad, kv_grad.to(kv.dtype), sink_grad.to(sink.dtype), None, None, None
+
+
+def unfused_compressed_sparse_attn(
+    query: torch.Tensor,
+    kv_full: torch.Tensor,
+    attn_sink: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    *,
+    query_chunk_size: int = 0,
+) -> torch.Tensor:
+    """Compute reference sparse attention, optionally bounding packed query intermediates.
+
+    A zero chunk size preserves the unchunked path. Chunking supports first-order
+    training gradients; SBHD and short THD inputs use the ordinary autograd path.
+    """
+    if query_chunk_size < 0:
+        raise ValueError('query_chunk_size must be nonnegative')
+    if query.ndim == 3 and query_chunk_size and query.shape[0] > query_chunk_size:
+        return _ChunkedSparseAttention.apply(
+            query, kv_full, attn_sink, topk_indices, softmax_scale, query_chunk_size
+        )
+    return _unfused_compressed_sparse_attn(query, kv_full, attn_sink, topk_indices, softmax_scale)
 
 
 @torch.no_grad()
