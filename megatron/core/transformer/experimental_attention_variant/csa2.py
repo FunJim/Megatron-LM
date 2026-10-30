@@ -842,8 +842,17 @@ class CSA2Indexer(MegatronModule):
             )
         scaled_weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
         if thd_layout is not None:
-            scores = torch.einsum("thd,cd->thc", q.float(), k.float()).relu()
-            scores = (scores * scaled_weights.unsqueeze(-1)).sum(dim=1)
+            chunk_size = getattr(self.config, 'csa_query_chunk_size', 0)
+            if chunk_size > 0 and not torch.is_grad_enabled():
+                scores = q.new_empty((q.shape[0], k.shape[0]), dtype=torch.float32)
+                k_float = k.float()
+                for start in range(0, q.shape[0], chunk_size):
+                    end = min(start + chunk_size, q.shape[0])
+                    chunk = torch.einsum("thd,cd->thc", q[start:end].float(), k_float).relu()
+                    scores[start:end] = (chunk * scaled_weights[start:end].unsqueeze(-1)).sum(dim=1)
+            else:
+                scores = torch.einsum("thd,cd->thc", q.float(), k.float()).relu()
+                scores = (scores * scaled_weights.unsqueeze(-1)).sum(dim=1)
             valid = (
                 thd_layout.valid_tokens[:, None]
                 & compressed_layout.valid_groups[None, :]
@@ -1713,7 +1722,12 @@ class CompressedSparseAttention2(MegatronModule):
             kv, indices = self._attention_inputs(local, window, global_kv, topk)
         # Repeated KV positions accumulate their gradients in FP32.
         output = unfused_compressed_sparse_attn(
-            query, kv.float(), self.attn_sink, indices, self.softmax_scale
+            query,
+            kv.float(),
+            self.attn_sink,
+            indices,
+            self.softmax_scale,
+            query_chunk_size=getattr(self.config, 'csa_query_chunk_size', 0),
         )
         return output, loss
 

@@ -52,6 +52,29 @@ from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
 
+def _multi_tensor_applier_by_dtype(op, overflow, tensor_lists, *args):
+    """Keep different gradient dtypes and devices in separate fused kernel launches."""
+    groups = {}
+    for index, tensors in enumerate(zip(*tensor_lists)):
+        key = tuple((tensor.dtype, tensor.device) for tensor in tensors)
+        groups.setdefault(key, []).append(index)
+    if len(groups) <= 1:
+        return multi_tensor_applier(op, overflow, tensor_lists, *args)
+    results = []
+    for indices in groups.values():
+        lists = [[tensors[index] for index in indices] for tensors in tensor_lists]
+        results.append((indices, multi_tensor_applier(op, overflow, lists, *args)))
+    if op is l2_norm_impl:
+        norm = torch.stack([result[0].square() for _, result in results]).sum(0).sqrt()
+        per_tensor = results[0][1][1]
+        if args[0]:
+            per_tensor = norm.new_empty(len(tensor_lists[0]))
+            for indices, result in results:
+                per_tensor[indices] = result[1]
+        return norm, per_tensor
+    return None
+
+
 def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
@@ -113,7 +136,7 @@ def get_grad_norm_fp32(
             # Use apex's multi-tensor applier for efficiency reasons.
             # Multi-tensor applier takes a function and a list of list
             # and performs the operation on that list all in one kernel.
-            grad_norm, _ = multi_tensor_applier(
+            grad_norm, _ = _multi_tensor_applier_by_dtype(
                 l2_norm_impl, dummy_overflow_buf, [grads_for_norm], False  # no per-parameter norm
             )
             # Since we will be summing across data parallel groups,
@@ -183,11 +206,11 @@ def clip_grad_by_total_norm_fp32(
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
-        multi_tensor_applier(
+        _multi_tensor_applier_by_dtype(
             multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
     elif clip_coeff < 1.0:
-        multi_tensor_applier(
+        _multi_tensor_applier_by_dtype(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
 

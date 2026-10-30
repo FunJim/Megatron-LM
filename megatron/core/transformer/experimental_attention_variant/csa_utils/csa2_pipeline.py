@@ -519,7 +519,8 @@ class CSA2PipelinePayload(PipelinePayload):
                 max_seqlen_kv=self.max_seqlen,
                 pad_between_seqs=True,
                 cp_partition_mode="contiguous" if self.cp_size > 1 else "zigzag",
-                local_cp_size=self.cp_size if self.cp_size > 1 else None,
+                # Static CP uses the supplied group; local_cp_size denotes dynamic CP.
+                local_cp_size=None,
                 cp_group=cp_group if self.cp_size > 1 else None,
             )
             layout = build_csa2_thd_layout(params, hidden.shape[0], cp_group=cp_group)
