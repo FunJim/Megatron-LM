@@ -773,6 +773,7 @@ class _ChunkedSparseAttention(torch.autograd.Function):
             query_grad[start:end] = dq
             kv_grad.add_(dk.float())
             sink_grad.add_(ds.float())
+            del q, k, s, output, dq, dk, ds
         return query_grad, kv_grad.to(kv.dtype), sink_grad.to(sink.dtype), None, None, None
 
 

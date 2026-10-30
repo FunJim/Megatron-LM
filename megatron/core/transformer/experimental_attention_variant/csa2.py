@@ -850,6 +850,7 @@ class CSA2Indexer(MegatronModule):
                     end = min(start + chunk_size, q.shape[0])
                     chunk = torch.einsum("thd,cd->thc", q[start:end].float(), k_float).relu()
                     scores[start:end] = (chunk * scaled_weights[start:end].unsqueeze(-1)).sum(dim=1)
+                    del chunk
             else:
                 scores = torch.einsum("thd,cd->thc", q.float(), k.float()).relu()
                 scores = (scores * scaled_weights.unsqueeze(-1)).sum(dim=1)
