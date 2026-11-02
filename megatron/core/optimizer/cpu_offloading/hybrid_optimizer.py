@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import Dict
 
 import torch
+from torch.optim.sgd import sgd
 
 
 def _param_generator(cpu_optimizer):
@@ -52,8 +53,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        cpu_streaming_sgd: bool = False,
         **kwargs,
     ):
+        if cpu_streaming_sgd:
+            if offload_fraction != 1.0 or not param_update_in_fp32:
+                raise ValueError('cpu_streaming_sgd requires complete CPU offload and FP32 updates')
+            if cpu_optimizer_cls is not torch.optim.SGD:
+                raise ValueError('cpu_streaming_sgd requires torch.optim.SGD')
         super(HybridDeviceOptimizer, self).__init__(
             params,
             defaults={
@@ -64,6 +71,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
+                "cpu_streaming_sgd": cpu_streaming_sgd,
                 **kwargs,
             },
         )
@@ -75,6 +83,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_params = pin_cpu_params
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
+        self.cpu_streaming_sgd = cpu_streaming_sgd
+        self._streaming_sgd_scratch = None
+        self.streaming_updated_elements = 0
+        self.streaming_cpu_gradient_bytes = 0
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
@@ -159,6 +171,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
 
+        if self.cpu_streaming_sgd:
+            return self._step_cpu_streaming_sgd(closure)
+
         self._d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._d2h_stream):
             self._set_sub_optimizer_grads()
@@ -176,6 +191,77 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
         #   in param_groups.
+        self._sync_sub_optimizers_state_to_hdo()
+
+    @torch.no_grad()
+    def _step_cpu_streaming_sgd(self, closure=None):
+        """Update FP32 CPU masters without allocating full-size CPU gradient copies."""
+        if closure is not None:
+            raise ValueError('cpu_streaming_sgd does not support closures')
+        if self.offload_fraction != 1.0 or self.gpu_optimizer is not None:
+            raise ValueError('cpu_streaming_sgd requires complete CPU optimizer offload')
+        for optimizer in self.cpu_optimizers:
+            if not isinstance(optimizer, torch.optim.SGD):
+                raise ValueError('cpu_streaming_sgd requires torch.optim.SGD')
+            for group in optimizer.param_groups:
+                if (
+                    group['momentum'] != 0.0
+                    or group['weight_decay'] != 0.0
+                    or group['nesterov']
+                    or group['maximize']
+                    or group.get('differentiable', False)
+                ):
+                    raise ValueError('cpu_streaming_sgd requires momentum-free, zero-decay SGD')
+
+        if self._streaming_sgd_scratch is None:
+            self._streaming_sgd_scratch = torch.empty(
+                16 * 1024 * 1024, dtype=torch.float32, device='cpu', pin_memory=True
+            )
+        scratch = self._streaming_sgd_scratch
+        torch.cuda.synchronize()
+        self.streaming_updated_elements = 0
+        self.streaming_cpu_gradient_bytes = scratch.numel() * scratch.element_size()
+        for optimizer in self.cpu_optimizers:
+            for group in optimizer.param_groups:
+                for param in group['params']:
+                    gpu_param = self.cpu_copys_map_gpu_param[param]
+                    grad = getattr(gpu_param, 'decoupled_grad', gpu_param.grad)
+                    if grad is None:
+                        continue
+                    if (
+                        param.dtype != torch.float32
+                        or param.is_cuda
+                        or not param.is_contiguous()
+                        or not grad.is_contiguous()
+                        or not gpu_param.is_contiguous()
+                        or param.shape != grad.shape
+                        or param.shape != gpu_param.shape
+                        or grad.is_sparse
+                    ):
+                        raise ValueError('cpu_streaming_sgd requires contiguous matching parameters and gradients')
+                    master = param.view(-1)
+                    gradient = grad.view(-1)
+                    gpu_flat = gpu_param.view(-1)
+                    for start in range(0, master.numel(), scratch.numel()):
+                        stop = min(start + scratch.numel(), master.numel())
+                        transfer = scratch[: stop - start]
+                        transfer.copy_(gradient[start:stop], non_blocking=False)
+                        sgd(
+                            [master[start:stop]],
+                            [transfer],
+                            [None],
+                            foreach=False,
+                            fused=False,
+                            weight_decay=0.0,
+                            momentum=0.0,
+                            lr=group['lr'],
+                            dampening=group['dampening'],
+                            nesterov=False,
+                            maximize=False,
+                        )
+                        transfer.copy_(master[start:stop])
+                        gpu_flat[start:stop].copy_(transfer, non_blocking=False)
+                        self.streaming_updated_elements += stop - start
         self._sync_sub_optimizers_state_to_hdo()
 
     def _init_sub_optimizers(self):

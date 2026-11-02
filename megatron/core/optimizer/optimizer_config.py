@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
@@ -351,6 +352,16 @@ class OptimizerConfig:
     optimizer_offload_fraction: float = 0.0
     """Specifies the fraction of optimizer states to offload from GPU memory to CPU."""
 
+    cpu_streaming_sgd: bool = field(
+        default_factory=lambda: os.environ.get('MCORE_CPU_STREAMING_SGD', '0') == '1'
+    )
+    """Update CPU FP32 master weights with a reusable 64 MiB gradient staging buffer.
+
+    Disabled by default. MCORE_CPU_STREAMING_SGD=1 supplies the default for callers without
+    this config field; an explicitly supplied value takes precedence. Requires momentum-free,
+    zero-weight-decay SGD with precision-aware gradients and complete CPU optimizer offload.
+    """
+
     use_torch_optimizer_for_cpu_offload: bool = False
     """If True, use torch.optim.Optimizer for CPU offload."""
 
@@ -414,6 +425,22 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        if self.cpu_streaming_sgd:
+            assert self.optimizer == 'sgd', 'cpu_streaming_sgd requires SGD'
+            assert self.sgd_momentum == 0.0, 'cpu_streaming_sgd requires sgd_momentum=0'
+            assert self.weight_decay == 0.0, 'cpu_streaming_sgd requires weight_decay=0'
+            assert self.optimizer_cpu_offload, 'cpu_streaming_sgd requires optimizer_cpu_offload'
+            assert (
+                self.optimizer_offload_fraction == 1.0
+            ), 'cpu_streaming_sgd requires optimizer_offload_fraction=1.0'
+            assert (
+                self.use_precision_aware_optimizer
+            ), 'cpu_streaming_sgd requires use_precision_aware_optimizer'
+            assert (
+                self.main_params_dtype == torch.float32
+            ), 'cpu_streaming_sgd requires FP32 master parameters'
+            assert not self.optimizer_cuda_graph, 'cpu_streaming_sgd does not support CUDA graphs'
 
         used_deprecated_optimizer_state_offload = self.offload_optimizer_states
         if self.offload_optimizer_states:
@@ -518,8 +545,8 @@ class OptimizerConfig:
 
         if self.use_precision_aware_optimizer:
             assert (
-                self.optimizer == 'adam'
-            ), '--use-precision-aware-optimizer only supported with adam'
+                self.optimizer == 'adam' or self.cpu_streaming_sgd
+            ), '--use-precision-aware-optimizer requires adam or cpu_streaming_sgd'
             assert (
                 self.use_distributed_optimizer
             ), '--use-precision-aware-optimizer only supported with distributed optimizer'
