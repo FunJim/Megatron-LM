@@ -238,7 +238,10 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                         or param.shape != gpu_param.shape
                         or grad.is_sparse
                     ):
-                        raise ValueError('cpu_streaming_sgd requires contiguous matching parameters and gradients')
+                        raise ValueError(
+                            'cpu_streaming_sgd requires contiguous matching '
+                            'parameters and gradients'
+                        )
                     master = param.view(-1)
                     gradient = grad.view(-1)
                     gpu_flat = gpu_param.view(-1)
@@ -466,8 +469,9 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         """
         Update the fp32 parameters by the new parameters.
         """
-        for param, fp32_param in self.param_to_fp32_param.items():
-            fp32_param.data.copy_(param)
+        for param, inner_param in self.param_to_inner_param.items():
+            if inner_param is not param:
+                inner_param.data.copy_(param)
 
     def _register_load_state_dict_hooks(self):
         def pre_load_state_dict_hook(self, state_dict):
