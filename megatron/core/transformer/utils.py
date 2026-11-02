@@ -78,7 +78,49 @@ def erf_gelu(x):
 
 @torch.no_grad()
 def cat_with_oom_fallback(sub_state_dict):
-    """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    """Reuse adjacent checkpoint views, falling back to CPU if device-side cat OOMs."""
+    if sub_state_dict:
+        first = sub_state_dict[0]
+        if (
+            type(first) is torch.Tensor
+            and first.layout == torch.strided
+            and not first.is_quantized
+            and not first.is_conj()
+            and not first.is_neg()
+            and first.ndim > 0
+            and first.numel() > 0
+            and first.is_contiguous()
+        ):
+            storage = first.untyped_storage()
+            offset = first.storage_offset()
+            rows = 0
+            for tensor in sub_state_dict:
+                if not (
+                    type(tensor) is torch.Tensor
+                    and tensor.layout == torch.strided
+                    and not tensor.is_quantized
+                    and not tensor.is_conj()
+                    and not tensor.is_neg()
+                    and tensor.device == first.device
+                    and tensor.dtype == first.dtype
+                    and tensor.shape[1:] == first.shape[1:]
+                    and tensor.ndim == first.ndim
+                    and tensor.numel() > 0
+                    and tensor.is_contiguous()
+                    and tensor.untyped_storage().data_ptr() == storage.data_ptr()
+                    and tensor.storage_offset() == offset
+                ):
+                    break
+                rows += tensor.shape[0]
+                offset += tensor.numel()
+            else:
+                shape = (rows, *first.shape[1:])
+                stride = []
+                product = 1
+                for size in reversed(shape):
+                    stride.insert(0, product)
+                    product *= size
+                return first.detach().as_strided(shape, stride, first.storage_offset())
     try:
         return torch.cat(sub_state_dict)
     except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
