@@ -465,6 +465,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             if fp32_param is not None:
                 fp32_param.data.copy_(v["master_param"])
 
+    @torch.no_grad()
     def update_fp32_param_by_new_param(self):
         """
         Update the fp32 parameters by the new parameters.
