@@ -1297,6 +1297,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # run under no_grad.
             with torch.no_grad():
                 for key in dst_tensors:
+                    if key == "step":
+                        # Restored separately from the checkpoint param groups.
+                        continue
                     if not isinstance(tensors[key], torch.Tensor):
                         continue
                     dst_tensors[key].copy_(tensors[key])
@@ -2175,7 +2178,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
                         # Main param & optimizer states.
-                        self._set_main_param_and_optimizer_states(model_param, src_tensors)
+                        # The bucket step is nonpersistent and comes from the local load
+                        # template. Preserve the step restored by load_state_dict instead.
+                        self._set_main_param_and_optimizer_states(
+                            model_param, {k: v for k, v in src_tensors.items() if k != "step"}
+                        )
 
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):
