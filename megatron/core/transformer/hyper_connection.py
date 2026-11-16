@@ -9,6 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.transformer.mhc_chunked import (
+    aggregate_chunk,
+    bda_chunk,
+    chunked_mhc,
+    token_chunk_size,
+)
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
@@ -69,6 +75,9 @@ class SinglePassMHCState:
             from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate
 
             return fused_h_aggregate(streams, self.pre_mix.to(hidden_states.dtype))
+        chunk_size = token_chunk_size()
+        if chunk_size and hidden_states.numel():
+            return chunked_mhc(aggregate_chunk, chunk_size, 2, hidden_states, self.pre_mix)[0]
         return (
             (streams.float() * self.pre_mix.float().unsqueeze(-1)).sum(-2).to(hidden_states.dtype)
         )
@@ -500,6 +509,41 @@ class HyperConnectionModule(MegatronModule):
                 h_pre.reshape(s, b, self.n).to(x.dtype),
                 h_post.reshape(s, b, self.n).to(x.dtype),
                 h_res.to(x.dtype),
+            )
+        chunk_size = token_chunk_size()
+        if chunk_size and x.numel():
+
+            def mappings(hidden, weight, alpha_pre, alpha_post, alpha_res, bias):
+                hidden = hidden.float()
+                inv_rms = torch.rsqrt(hidden.square().mean(-1, keepdim=True) + self.norm_eps)
+                with torch.autocast(device_type=hidden.device.type, enabled=False):
+                    mixes = F.linear(hidden, weight.float()) * inv_rms
+                h_pre = (
+                    mixes[..., : self.n] * alpha_pre.float() + bias[: self.n].float()
+                ).sigmoid() + self.compute_h_eps
+                h_post = (
+                    mixes[..., self.n : 2 * self.n] * alpha_post.float()
+                    + bias[self.n : 2 * self.n].float()
+                ).sigmoid() * 2
+                h_res = (
+                    mixes[..., 2 * self.n :] * alpha_res.float() + bias[2 * self.n :].float()
+                ).unflatten(-1, (self.n, self.n))
+                return (
+                    h_pre,
+                    h_post,
+                    _sinkhorn_iterations_native(h_res, self.sinkhorn_iterations, self.sinkhorn_eps),
+                )
+
+            return chunked_mhc(
+                mappings,
+                chunk_size,
+                1,
+                x,
+                self.mapping_proj.weight,
+                self.alpha_pre,
+                self.alpha_post,
+                self.alpha_res,
+                self.bias,
             )
         x_fp32 = x.float()
         inv_rms = torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + self.norm_eps)
@@ -979,6 +1023,11 @@ class HyperConnectionModule(MegatronModule):
             streams = original_residual.unflatten(-1, (self.n, self.hidden_size))
             with torch.autocast(device_type=x.device.type, enabled=False):
                 return self._h_post_bda_op(h_res, streams, h_post, x, bias).flatten(-2)
+        chunk_size = token_chunk_size()
+        if chunk_size and original_residual.numel() and (not training or dropout_prob == 0.0):
+            return chunked_mhc(bda_chunk, chunk_size, 4, h_res, original_residual, h_post, x, bias)[
+                0
+            ]
         streams = original_residual.float().unflatten(-1, (self.n, self.hidden_size))
         mixed = (h_res.float().unsqueeze(-1) * streams.unsqueeze(-2)).sum(-3)
         expanded = h_post.float().unsqueeze(-1) * x.float().unsqueeze(-2)
