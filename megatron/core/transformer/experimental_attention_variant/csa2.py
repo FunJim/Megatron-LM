@@ -915,6 +915,25 @@ class CSA2Indexer(MegatronModule):
 
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
+        chunk_size = getattr(self.config, "csa_query_chunk_size", 0)
+        width = min(self.topk, scores.shape[-1])
+        if scores.numel() and chunk_size > 0:
+            rows = scores.reshape(-1, scores.shape[-1])
+            if rows.shape[0] > chunk_size:
+                output = torch.empty(
+                    (*scores.shape[:-1], width), dtype=torch.int32, device=scores.device
+                )
+                flat_output = output.reshape(rows.shape[0], width)
+                for start in range(0, rows.shape[0], chunk_size):
+                    end = min(start + chunk_size, rows.shape[0])
+                    chunk = rows[start:end]
+                    indices = chunk.argsort(dim=-1, descending=True, stable=True)[..., :width]
+                    indices = indices.sort(dim=-1).values
+                    flat_output[start:end].copy_(
+                        indices.masked_fill(~chunk.gather(-1, indices).isfinite(), -1).int()
+                    )
+                    del indices
+                return output
         # A stable tie order preserves selection across SBHD/THD and different
         # padding capacities. Physical order within each sequence is local order.
         indices = scores.argsort(dim=-1, descending=True, stable=True)[
@@ -922,6 +941,72 @@ class CSA2Indexer(MegatronModule):
         ]
         indices = indices.sort(dim=-1).values
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
+
+    @torch.no_grad()
+    def _select_projected_chunks(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        *,
+        candidates: CSA2CandidateBlocks | torch.Tensor | None,
+        thd_layout: CSA2THDLayout,
+        compressed_layout: CSA2THDCompressionLayout,
+        return_candidates: bool,
+    ) -> tuple[torch.Tensor, CSA2CandidateBlocks | None]:
+        """Select native THD rows without retaining the full query/key score matrix."""
+        chunk_size = self.config.csa_query_chunk_size
+        indices = torch.empty(
+            (q.shape[0], min(self.topk, k.shape[0])), dtype=torch.int32, device=q.device
+        )
+        blocks = None
+        for start in range(0, q.shape[0], chunk_size):
+            end = min(start + chunk_size, q.shape[0])
+            layout = replace(
+                thd_layout,
+                total_tokens=end - start,
+                sequence_ids=thd_layout.sequence_ids[start:end],
+                position_ids=thd_layout.position_ids[start:end],
+                valid_tokens=thd_layout.valid_tokens[start:end],
+            )
+            chunk_candidates = candidates
+            if isinstance(candidates, CSA2CandidateBlocks):
+                chunk_candidates = replace(
+                    candidates,
+                    indices=candidates.indices[start:end],
+                    lengths=candidates.lengths[start:end],
+                )
+            elif candidates is not None:
+                chunk_candidates = candidates[start:end]
+            scores = self._score_projected(
+                q[start:end],
+                k,
+                weights[start:end],
+                candidates=chunk_candidates,
+                thd_layout=layout,
+                compressed_layout=compressed_layout,
+            )
+            indices[start:end].copy_(self.select_indices(scores))
+            if return_candidates:
+                selected = self._candidate_blocks(
+                    q[start:end],
+                    k,
+                    weights[start:end],
+                    selection_scores=scores,
+                    thd_layout=layout,
+                    compressed_layout=compressed_layout,
+                )
+                if blocks is None:
+                    blocks = CSA2CandidateBlocks(
+                        selected.indices.new_empty((q.shape[0], selected.indices.shape[-1])),
+                        selected.lengths.new_empty((q.shape[0],)),
+                        selected.block_size,
+                    )
+                blocks.indices[start:end].copy_(selected.indices)
+                blocks.lengths[start:end].copy_(selected.lengths)
+                del selected
+            del scores, chunk_candidates
+        return indices, blocks
 
     @torch.no_grad()
     def _get_compact_indexer_workspace(
@@ -1173,8 +1258,18 @@ class CSA2Indexer(MegatronModule):
         )
         fused_topk = self.use_fused_kernels
         native_selection = not fused_topk
+        chunked_selection = (
+            native_selection
+            and self.precision == "bf16"
+            and not return_scores
+            and not return_loss_inputs
+            and thd_layout is not None
+            and 0 < getattr(self.config, "csa_query_chunk_size", 0) < q.shape[0]
+        )
         scores = None
-        if return_scores or (native_selection and self.precision == "bf16"):
+        if return_scores or (
+            native_selection and self.precision == "bf16" and not chunked_selection
+        ):
             scores = self._score_projected(q, k, weights, **score_kwargs)
         # Prepare while the projection graph is enabled. Selection reads these
         # same tensors under no_grad; supervised consumers retain the K owner edge.
@@ -1196,9 +1291,19 @@ class CSA2Indexer(MegatronModule):
                 indices, candidate_blocks = self._fused_topk_and_candidates(inputs)
             elif fused_topk:
                 indices = self._fused_topk(inputs)
+            elif chunked_selection:
+                indices, candidate_blocks = self._select_projected_chunks(
+                    q,
+                    k,
+                    weights,
+                    candidates=candidates,
+                    thd_layout=thd_layout,
+                    compressed_layout=compressed_layout,
+                    return_candidates=return_candidates,
+                )
             else:
                 indices = self.select_indices(selection_scores)
-            if return_candidates and not fused_topk:
+            if return_candidates and not fused_topk and not chunked_selection:
                 candidate_blocks = self._candidate_blocks(
                     q,
                     k,
