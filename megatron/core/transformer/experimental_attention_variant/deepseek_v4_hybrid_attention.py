@@ -7,6 +7,7 @@ from typing import NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.component_nvtx import component, forward_range
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_inplace,
@@ -227,6 +228,7 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
+    @component("attention")
     def forward(
         self,
         hidden_states,
@@ -295,12 +297,13 @@ class DSv4HybridAttention(Attention):
 
         boundary_hidden = None
         if use_thd_cp:
-            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
-                hidden_states,
-                self._dsv4_compress_ratio,
-                self.config.csa_window_size,
-                self.pg_collection.cp,
-            )
+            with forward_range("communication.cp_boundary"):
+                boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                    hidden_states,
+                    self._dsv4_compress_ratio,
+                    self.config.csa_window_size,
+                    self.pg_collection.cp,
+                )
 
         # =====================
         # Query, Key, and Value
@@ -367,6 +370,15 @@ class DSv4HybridAttention(Attention):
             self.qkv_up_checkpoint.discard_output_and_register_recompute(core_attn_out)
             self.qkv_up_checkpoint = None
 
+        output, bias = self._output_projection(
+            core_attn_out, packed_seq_params, hidden_states.dtype, inference_context, use_thd_cp
+        )
+        self.pg_collection.cp = _orig_cp_group
+        return output, bias
+
+    @component("attention.output_projection")
+    def _output_projection(self, core_attn_out, packed_seq_params, input_dtype, inference_context, use_thd_cp):
+        """Run output RoPE and projections with the existing parameter layout."""
         # inverse RoPE on last qk_pos_emb_head_dim of each head
         seq_len = core_attn_out.size(0)
         n_heads = self.num_attention_heads_per_partition
@@ -408,7 +420,7 @@ class DSv4HybridAttention(Attention):
             # cached cos/sin so the fused kernel matches the unfused
             # path's forced ``mscale=1.0`` (DSv4 "pure rotation").
             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-                rope_seqlen, dtype=hidden_states.dtype, packed_seq=packed_seq, mscale=mscale
+                rope_seqlen, dtype=input_dtype, packed_seq=packed_seq, mscale=mscale
             )
             rotary_pos_emb = None
             assert inference_context is None, "Inference with MLA RoPE fusion is not supported"
@@ -521,7 +533,6 @@ class DSv4HybridAttention(Attention):
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
-        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
 
@@ -625,6 +636,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             eps=self.config.attention_latent_norm_epsilon,
         )
 
+    @component("attention.qkv_projection")
     def get_query_key_value_tensors(
         self,
         hidden_states,

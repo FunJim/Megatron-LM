@@ -310,6 +310,109 @@ class ComponentNvtxTests(unittest.TestCase):
         fn(torch.ones(4, requires_grad=True)).sum().backward()
         self.mock.start()
 
+    def test_chunked_native_attention_outputs_and_gradients_are_unchanged(self):
+        path = ROOT / "megatron/core/transformer/experimental_attention_variant/csa.py"
+        tree = ast.parse(path.read_text())
+        wanted = {
+            "_unfused_compressed_sparse_attn",
+            "_ChunkedSparseAttention",
+            "unfused_compressed_sparse_attn",
+        }
+        nodes = [
+            node
+            for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted
+        ]
+        namespace = {"torch": torch, "F": torch.nn.functional}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        torch.manual_seed(27)
+        q = torch.randn(9, 2, 4, requires_grad=True)
+        k = torch.randn(10, 4, requires_grad=True)
+        sink = torch.zeros(2, requires_grad=True)
+        indices = torch.arange(3).expand(9, -1).int()
+        values = []
+        for measured in (False, True):
+            fn = namespace["unfused_compressed_sparse_attn"]
+            if measured:
+                fn = self.nvtx.component("attention.native")(fn)
+            out = fn(q, k, sink, indices, 0.5, query_chunk_size=3)
+            gradients = torch.autograd.grad(out.sum(), (q, k, sink))
+            values.append((out, gradients))
+        torch.testing.assert_close(values[0][0], values[1][0], atol=0, rtol=0)
+        for left, right in zip(values[0][1], values[1][1]):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+
+    def test_attention_output_projection_matches_independent_reference(self):
+        path = (
+            ROOT
+            / "megatron/core/transformer/experimental_attention_variant/deepseek_v4_hybrid_attention.py"
+        )
+        tree = ast.parse(path.read_text())
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DSv4HybridAttention"
+        )
+        method = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_output_projection"
+        )
+
+        class Manager:
+            def __init__(self, enabled, value, name):
+                self.value = value
+
+            def __enter__(self):
+                return self.value
+
+            def __exit__(self, *args):
+                return None
+
+            def group_offload(self, value, **kwargs):
+                return value
+
+        namespace = {
+            "torch": torch,
+            "component": self.nvtx.component,
+            "off_interface": Manager,
+            "apply_rotary_pos_emb": lambda x, *args, **kwargs: x,
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
+        torch.manual_seed(27)
+        weight = nn.Parameter(torch.randn(6, 4))
+        linear = nn.Linear(6, 5)
+        holder = SimpleNamespace(
+            config=SimpleNamespace(
+                qk_pos_emb_head_dim=2,
+                v_head_dim=4,
+                dsv4_version="v4.1",
+                apply_rope_fusion=False,
+                o_lora_rank=3,
+            ),
+            num_attention_heads_per_partition=2,
+            _dsv4_uses_yarn_rope=False,
+            rotary_pos_emb=lambda length, **kwargs: torch.ones(length, 2),
+            pg_collection=SimpleNamespace(cp=None),
+            o_local_groups=2,
+            query_projection_size=8,
+            linear_o_group_proj=weight,
+            offload_attn_proj=False,
+            linear_proj=lambda x: (linear(x), None),
+        )
+        x = torch.randn(7, 1, 8, requires_grad=True)
+        expected = linear(
+            torch.einsum("tbgd,grd->tbgr", x.reshape(7, 1, 2, 4), weight.reshape(2, 3, 4)).reshape(
+                7, 1, 6
+            )
+        )
+        actual, _ = namespace["_output_projection"](holder, x, None, x.dtype, None, False)
+        reference = torch.autograd.grad(expected.sum(), (x, weight, *linear.parameters()))
+        actual_grad = torch.autograd.grad(actual.sum(), (x, weight, *linear.parameters()))
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for left, right in zip(reference, actual_grad):
+            torch.testing.assert_close(left, right, atol=0, rtol=0)
+
 
 if __name__ == "__main__":
     unittest.main()

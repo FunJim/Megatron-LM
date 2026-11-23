@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from megatron.core.component_nvtx import component, forward_range
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -93,6 +94,8 @@ from megatron.core.utils import get_pg_size
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_layer import RecomputeTensors
+
+_profiled_native_attention = component("attention.native")(unfused_compressed_sparse_attn)
 
 
 @dataclass
@@ -445,6 +448,7 @@ class CSA2Compressor(MegatronModule):
             eps=config.attention_latent_norm_epsilon,
         )
 
+    @component("attention.compressor")
     def forward(
         self,
         x: torch.Tensor,
@@ -718,6 +722,7 @@ class CSA2Indexer(MegatronModule):
                 eps=config.attention_latent_norm_epsilon,
             )
 
+    @component("indexer.key_projection")
     def project_keys(
         self,
         latent: torch.Tensor,
@@ -762,6 +767,7 @@ class CSA2Indexer(MegatronModule):
             inplace=False,
         )
 
+    @component("indexer.query_projection")
     def _project_inputs(
         self,
         x: torch.Tensor,
@@ -943,6 +949,7 @@ class CSA2Indexer(MegatronModule):
         return indices.masked_fill(~scores.gather(-1, indices).isfinite(), -1).int()
 
     @torch.no_grad()
+    @component("indexer.streamed_score_selection")
     def _select_projected_chunks(
         self,
         q: torch.Tensor,
@@ -1065,6 +1072,7 @@ class CSA2Indexer(MegatronModule):
         return workspace
 
     @torch.no_grad()
+    @component("indexer.selection")
     def _fused_topk(self, inputs: CSA2IndexerInputs) -> torch.Tensor:
         """Adapt DSv4 score/Top-K kernels to r1/r2 and physical CSA2 THD rows."""
         if inputs.candidates is not None:
@@ -1207,6 +1215,7 @@ class CSA2Indexer(MegatronModule):
             self.config.csa2_candidate_block_size,
         )
 
+    @component("indexer")
     def forward_with_scores(
         self,
         x: torch.Tensor,
@@ -1315,6 +1324,7 @@ class CSA2Indexer(MegatronModule):
         loss_inputs = inputs if return_loss_inputs else scores if return_scores else None
         return indices, loss_inputs, candidate_blocks
 
+    @component("indexer.selection_candidates")
     def _fused_topk_and_candidates(
         self, inputs: CSA2IndexerInputs
     ) -> tuple[torch.Tensor, CSA2CandidateBlocks]:
@@ -1503,14 +1513,15 @@ class CompressedSparseAttention2(MegatronModule):
             if cp_layout is not None:
                 # One autograd edge per shared tensor: reduce-scatter runs after
                 # all local consumers contribute, including future Reindex/Reuse.
-                indexer_gather = async_gather_from_sequence_parallel_region(
-                    state.indexer_k, group=cp_group
-                )
-                kv_gather = async_gather_from_sequence_parallel_region(
-                    state.global_kv, group=cp_group
-                )
-                state.indexer_k = cp_layout.to_sequence_major(indexer_gather.wait())
-                state.global_kv = cp_layout.to_sequence_major(kv_gather.wait())
+                with forward_range("communication.cp_shared_kv"):
+                    indexer_gather = async_gather_from_sequence_parallel_region(
+                        state.indexer_k, group=cp_group
+                    )
+                    kv_gather = async_gather_from_sequence_parallel_region(
+                        state.global_kv, group=cp_group
+                    )
+                    state.indexer_k = cp_layout.to_sequence_major(indexer_gather.wait())
+                    state.global_kv = cp_layout.to_sequence_major(kv_gather.wait())
             state.kv_source_layer = self.layer_idx
             # Pack shared K once per owner, with graph-connected views/copies.
             # All supervised consumers use the same storage and autograd edge.
@@ -1582,6 +1593,7 @@ class CompressedSparseAttention2(MegatronModule):
             )
         return state.global_kv, state.global_indices, scores if use_indexer_loss else None
 
+    @component("indexer.loss")
     def _compute_indexer_loss(
         self,
         query: torch.Tensor,
@@ -1760,6 +1772,7 @@ class CompressedSparseAttention2(MegatronModule):
         state.fused_window_size = window_size
         return state.fused_indices
 
+    @component("attention.fused")
     def _fused_attention(self, query, local, window, global_kv=None, topk=None, state=None):
         """Reuse V4 attention with shared indices and producer KV storage."""
         is_thd = query.ndim == 3
@@ -1827,7 +1840,7 @@ class CompressedSparseAttention2(MegatronModule):
                 )
             kv, indices = self._attention_inputs(local, window, global_kv, topk)
         # Repeated KV positions accumulate their gradients in FP32.
-        output = unfused_compressed_sparse_attn(
+        output = _profiled_native_attention(
             query,
             kv.float(),
             self.attn_sink,
@@ -1967,6 +1980,7 @@ class CompressedSparseAttention2(MegatronModule):
             cp_group=cp_group,
         )
 
+    @component("attention.csa2")
     def forward(
         self,
         query: torch.Tensor,

@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.component_nvtx import component
 from megatron.core.transformer.mhc_chunked import (
     aggregate_chunk,
     bda_chunk,
@@ -53,6 +54,7 @@ class SinglePassMHCState:
 
     pre_mix: Tensor | None = None
 
+    @component("mhc.aggregation")
     def contract(self, hidden_states: Tensor, n: int, *, use_fused: bool = False) -> Tensor:
         """Contract flattened ``[s, b, n*C]`` streams using the preceding mix.
 
@@ -361,6 +363,10 @@ class HyperConnectionModule(MegatronModule):
             self._h_post_bda_op = native_h_post_bda
             self._proj_rms_compute_h_op = None
 
+        self._sinkhorn_op = component("mhc.sinkhorn")(self._sinkhorn_op)
+        if self._proj_rms_compute_h_op is not None:
+            self._proj_rms_compute_h_op = component("mhc.projection_rms")(self._proj_rms_compute_h_op)
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -428,6 +434,7 @@ class HyperConnectionModule(MegatronModule):
         return h_pre, h_post, h_res
 
     @nvtx_decorator(message="HyperConnection::compute_mappings")
+    @component("mhc.mapping")
     def compute_mappings(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute mHC mappings from input hidden states.
@@ -646,6 +653,7 @@ class HyperConnectionModule(MegatronModule):
 
         return x_out, bias_out
 
+    @component("mhc.aggregation")
     def aggregate(self, x: Tensor, h_pre: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """
         Aggregate n-stream to 1-stream.
@@ -697,6 +705,7 @@ class HyperConnectionModule(MegatronModule):
 
         return mixed.view(s, b, n * C)
 
+    @component("mhc")
     def forward(
         self,
         hidden_states: Tensor,
@@ -774,6 +783,7 @@ class HyperConnectionModule(MegatronModule):
                 raise ValueError("fixed mHC outputs require an mHC recompute manager")
             return self._forward_normal(hidden_states)
 
+    @component("mhc.aggregation")
     def _single_pass_aggregate(
         self, hidden_states: Tensor, pre_mix: Tensor | None, out: Tensor | None = None
     ) -> Tensor:
@@ -895,6 +905,7 @@ class HyperConnectionModule(MegatronModule):
     # ==================== Block-level utilities ====================
 
     @staticmethod
+    @component("mhc.expand")
     def input_expand(x: Tensor, n: int) -> Tensor:
         """
         Expand 1-stream to n-stream at TransformerBlock entry.
@@ -914,6 +925,7 @@ class HyperConnectionModule(MegatronModule):
         return expanded.view(s, b, n * C)
 
     @staticmethod
+    @component("mhc.output_contract")
     def output_contract(x: Tensor, n: int) -> Tensor:
         """
         Contract n-stream to 1-stream at TransformerBlock exit.
@@ -1008,6 +1020,7 @@ class HyperConnectionModule(MegatronModule):
                 fused,
             )
 
+    @component("mhc.bda")
     def _single_pass_bda(
         self,
         h_res: Tensor,

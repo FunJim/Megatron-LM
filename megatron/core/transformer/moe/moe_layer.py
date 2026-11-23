@@ -10,6 +10,7 @@ from typing import Optional, Protocol
 import torch
 
 from megatron.core import tensor_parallel, utils
+from megatron.core.component_nvtx import component
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -516,6 +517,7 @@ class MoELayer(BaseMoELayer):
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
     @maybe_skip_or_early_return_by_cudagraph("route")
+    @component("moe.router")
     def route(
         self,
         hidden_states: torch.Tensor,
@@ -534,6 +536,7 @@ class MoELayer(BaseMoELayer):
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
+    @component("moe.preprocess")
     def preprocess(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ):
@@ -585,6 +588,7 @@ class MoELayer(BaseMoELayer):
             )
         return int(math.prod(hidden_states.shape[:-1]))
 
+    @component("moe.dispatch")
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
 
@@ -597,6 +601,7 @@ class MoELayer(BaseMoELayer):
         return self.token_dispatcher.token_dispatch(hidden_states, probs)
 
     @maybe_skip_or_early_return_by_cudagraph("shared_experts_compute")
+    @component("moe.shared_experts")
     def shared_experts_compute(self, hidden_states: torch.Tensor):
         """Computes the output of the shared experts.
 
@@ -658,6 +663,7 @@ class MoELayer(BaseMoELayer):
         )
 
     @internal_api
+    @component("moe.experts")
     def routed_experts_compute(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Computes the output of the routed experts on the dispatched tokens.
 
@@ -692,6 +698,7 @@ class MoELayer(BaseMoELayer):
 
         return output, mlp_bias
 
+    @component("moe.combine")
     def combine(self, output: torch.Tensor):
         """Combines expert outputs via communication and adds shared expert output.
 
@@ -701,6 +708,7 @@ class MoELayer(BaseMoELayer):
         output = self.token_dispatcher.token_combine(output)
         return output
 
+    @component("moe.postprocess")
     def postprocess(self, output: torch.Tensor, shared_expert_output: Optional[torch.Tensor]):
         """Project the output back from latent dimension to hidden dimension after combine
         in latent dimension if needed. Combine expert output with shared_experts if needed.
@@ -733,6 +741,7 @@ class MoELayer(BaseMoELayer):
         hidden_states, probs, residual = self.preprocess(hidden_states, probs, routing_map)
         return hidden_states, probs, residual
 
+    @component("moe")
     def forward(
         self,
         hidden_states: torch.Tensor,
