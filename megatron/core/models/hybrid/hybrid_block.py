@@ -14,6 +14,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from torch import Tensor, nn
 
+from megatron.core.component_nvtx import layer_scope, microbatch_scope
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
@@ -787,6 +788,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             layer.mlp_norm_manager = None
         return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
+    @layer_scope
     def forward(
         self,
         hidden_states: Tensor,
@@ -1282,6 +1284,7 @@ class HybridStack(MegatronModule):
             hook_tensors = (hidden_states, *forward_context.recompute_boundary_tensors())
             mhc_manager.discard_all_outputs_and_register_unified_recompute(hook_tensors)
 
+    @microbatch_scope
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],

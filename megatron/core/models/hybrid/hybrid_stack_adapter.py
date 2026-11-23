@@ -14,6 +14,7 @@ from torch.distributed import ProcessGroup
 from torch.nn import Module, ModuleList
 
 from megatron.core import tensor_parallel
+from megatron.core.component_nvtx import checkpoint_forward, component
 from megatron.core.extensions.transformer_engine import te_checkpoint
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_layer import CrossLayerState, RecomputeTensors
 
 
+@component("recompute_sync.gloo")
 def _synchronize_recompute_group(group: ProcessGroup, first_layer: int, last_layer: int) -> None:
     identity = torch.tensor([first_layer, last_layer], dtype=torch.int64, device='cpu')
     identities = [torch.empty_like(identity) for _ in range(group.size())]
@@ -175,7 +177,7 @@ def checkpointed_hybrid_forward(
             tensors, output_restore[0] = working.save_for_recompute()
             return hidden, *tensors
 
-        return forward, output_restore
+        return checkpoint_forward(forward) if use_checkpoint else forward, output_restore
 
     uniform = config.recompute_method == "uniform"
     count = config.recompute_num_layers

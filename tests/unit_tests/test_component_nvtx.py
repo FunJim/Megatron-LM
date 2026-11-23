@@ -203,6 +203,63 @@ class ComponentNvtxTests(unittest.TestCase):
             self.assertIs(fn(value), value)
         self.assertFalse(any(kind == "start" for kind, *_ in self.recorder.events))
 
+    def test_actual_hybrid_checkpoint_entry_marks_recompute(self):
+        path = ROOT / "megatron/core/models/hybrid/hybrid_stack_adapter.py"
+        tree = ast.parse(path.read_text())
+        node = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "checkpointed_hybrid_forward"
+        )
+        namespace = {
+            "torch": torch,
+            "checkpoint_forward": self.nvtx.checkpoint_forward,
+            "tensor_parallel": SimpleNamespace(
+                checkpoint=lambda fn, distribute, *args: checkpoint(fn, *args, use_reentrant=True)
+            ),
+        }
+        code = ast.Module(
+            body=[
+                ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0),
+                node,
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(code), str(path), "exec"), namespace)
+        config = SimpleNamespace(
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            fp8=None,
+            fp4=None,
+            quant_recipe=None,
+            distribute_saved_activations=False,
+        )
+
+        class Context:
+            cross_layer_state = None
+            mhc_state = None
+
+            def save_for_recompute(self):
+                return (), lambda values: Context()
+
+        layers = nn.ModuleList([nn.Linear(4, 4, bias=False)])
+        layers[0].layer_number = 1
+        x = torch.ones(2, 4, requires_grad=True)
+        fn = self.nvtx.component("fixture")(lambda layer, hidden, context: layer(hidden).tanh())
+        out = namespace["checkpointed_hybrid_forward"](
+            config,
+            layers,
+            x,
+            Context(),
+            tp_group=None,
+            quantization_context=lambda *args: nullcontext(),
+            layer_forward=fn,
+        )
+        out.sum().backward()
+        names = [name for kind, name, _ in self.recorder.events if kind == "push"]
+        self.assertTrue(any("phase=forward" in name for name in names))
+        self.assertTrue(any("phase=recompute" in name for name in names))
+
     def test_real_megatron_checkpoint_keeps_numerics_with_instrumentation(self):
         path = ROOT / "megatron/core/tensor_parallel/random.py"
         tree = ast.parse(path.read_text())
