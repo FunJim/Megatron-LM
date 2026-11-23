@@ -669,6 +669,12 @@ class TransformerConfig(ModelParallelConfig):
     distribute_saved_activations: Optional[bool] = False
     """If True, distribute recomputed activations across the model parallel group."""
 
+    hybrid_recompute_sync: bool = False
+    """Synchronize full V4.1 Hybrid replay groups on a CPU dp_cp communicator.
+    Prevents adjacent groups from interleaving CP backward and EP forward collectives
+    across ranks. This adds a host rendezvous before each recomputed group.
+    """
+
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
@@ -2610,6 +2616,11 @@ class TransformerConfig(ModelParallelConfig):
                 "CPU offloading does not work when activation recomputation is enabled"
             )
 
+        if self.hybrid_recompute_sync and not (
+            self.experimental_attention_variant == 'dsv4_hybrid' and self.dsv4_version == 'v4.1'
+        ):
+            raise ValueError('hybrid_recompute_sync is only supported by V4.1 HybridStack')
+
         if self.recompute_granularity is not None:
             if self.recompute_granularity not in ["full", "selective"]:
                 raise ValueError(
@@ -4321,6 +4332,17 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_dsv41_config(self) -> None:
         """Validate V4.1 training relationships and supported kernels on the DSv4 path."""
+        if self.hybrid_recompute_sync and (
+            self.recompute_granularity != 'full'
+            or self.recompute_method != 'uniform'
+            or self.cuda_graph_impl != 'none'
+            or self.enable_cuda_graph
+            or self.dynamic_context_parallel
+            or self.virtual_pipeline_model_parallel_size is not None
+        ):
+            raise ValueError(
+                'hybrid_recompute_sync requires static uniform full recompute without VPP or CUDA Graphs'
+            )
         if self.tensor_model_parallel_size != 1:
             raise ValueError("Native V4.1 currently requires tensor_model_parallel_size=1")
         if self.sequence_parallel:

@@ -7,6 +7,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Protocol
 
+import torch
+import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.nn import Module, ModuleList
@@ -24,6 +26,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_layer import CrossLayerState, RecomputeTensors
+
+
+def _synchronize_recompute_group(group: ProcessGroup, first_layer: int, last_layer: int) -> None:
+    identity = torch.tensor([first_layer, last_layer], dtype=torch.int64, device='cpu')
+    identities = [torch.empty_like(identity) for _ in range(group.size())]
+    dist.all_gather(identities, identity, group=group)
+    if any(not torch.equal(identity, value) for value in identities):
+        raise RuntimeError('Ranks entered different Hybrid recompute groups')
 
 
 @dataclass
@@ -137,6 +147,7 @@ def checkpointed_hybrid_forward(
     tp_group: ProcessGroup,
     quantization_context: Callable[[TransformerConfig, int], ContextManager],
     layer_forward: Callable[[Module, Tensor, HybridStackForwardContext], Tensor],
+    recompute_sync_group: ProcessGroup | None = None,
 ) -> Tensor:
     """Run full-recompute groups with explicit model and mHC tensor boundaries.
 
@@ -146,10 +157,16 @@ def checkpointed_hybrid_forward(
     restored state reach the next group or pipeline export.
     """
 
-    def group_forward(start, end, restore):
+    def group_forward(start, end, restore, use_checkpoint):
         output_restore = [None]
 
         def forward(hidden, *state_tensors):
+            if use_checkpoint and recompute_sync_group is not None and torch.is_grad_enabled():
+                # A CPU rendezvous cannot wait on outstanding CUDA work from a
+                # different communicator, unlike an NCCL barrier or device sync.
+                _synchronize_recompute_group(
+                    recompute_sync_group, layers[start].layer_number, layers[end - 1].layer_number
+                )
             working = restore(state_tensors)
             for index in range(start, end):
                 layer = layers[index]
@@ -167,14 +184,14 @@ def checkpointed_hybrid_forward(
     for start in range(0, len(layers), group_size):
         state_inputs, restore = context.save_for_recompute()
         args = (hidden_states, *state_inputs)
-        forward, output_restore = group_forward(
-            start, min(start + group_size, len(layers)), restore
-        )
         # Reentrant checkpointing needs a differentiable input. Frozen groups
         # run normally; block mode counts only eligible groups, including those
         # with frozen hidden states but live shared side inputs.
         use_checkpoint = (uniform or remaining > 0) and any(
             tensor is not None and tensor.requires_grad for tensor in args
+        )
+        forward, output_restore = group_forward(
+            start, min(start + group_size, len(layers)), restore, use_checkpoint
         )
         if use_checkpoint:
             if config.fp8 or config.fp4 or config.quant_recipe is not None:
