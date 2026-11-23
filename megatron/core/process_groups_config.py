@@ -114,6 +114,9 @@ class ProcessGroupCollection:
     # _DATA_PARALLEL_GROUP_WITH_CP
     dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
+    # Host-side rendezvous for ordered HybridStack recomputation.
+    dp_cp_gloo: torch.distributed.ProcessGroup | None = field(init=False)
+
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
@@ -218,6 +221,8 @@ class ProcessGroupCollection:
             ),
             'dp': parallel_state.get_data_parallel_group,
             'dp_cp': partial(parallel_state.get_data_parallel_group, with_context_parallel=True),
+            'dp_cp_gloo': lambda: getattr(parallel_state, '_DATA_PARALLEL_GROUP_WITH_CP_GLOO', None)
+            and parallel_state.get_data_parallel_group_gloo(with_context_parallel=True),
             'dp_cp_ag': lambda: None,
             'intra_dp_cp': partial(
                 parallel_state.get_data_parallel_group,
