@@ -960,6 +960,18 @@ class HybridStack(MegatronModule):
         # Required for pipeline parallel schedules
         self.input_tensor = None
         self.pg_collection = pg_collection
+        self.recompute_sync_group = None
+        if config.hybrid_recompute_sync:
+            self.recompute_sync_group = getattr(pg_collection, 'dp_cp_gloo', None)
+            if (
+                self.recompute_sync_group is None
+                or torch.distributed.get_backend(self.recompute_sync_group) != 'gloo'
+            ):
+                raise ValueError('hybrid_recompute_sync requires a dp_cp_gloo process group')
+            members = set(torch.distributed.get_process_group_ranks(self.recompute_sync_group))
+            for group in (pg_collection.cp, pg_collection.ep):
+                if not set(torch.distributed.get_process_group_ranks(group)) <= members:
+                    raise ValueError('The recompute sync group must contain every CP and EP rank')
 
         # Lazily populated mHC recompute layout cache (deterministic from config
         # and num_layers); see `_build_mhc_recompute_layer_plan`.
@@ -1443,6 +1455,7 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                         quantization_context=get_inner_quant_context,
                         layer_forward=layer_forward,
+                        recompute_sync_group=self.recompute_sync_group,
                     )
                     mhc_state = forward_context.mhc_state
                 else:
