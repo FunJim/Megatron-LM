@@ -13,6 +13,7 @@ from collections import deque
 import torch
 import torch.distributed as dist
 
+from megatron.core.component_nvtx import forward_range, host_scope
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator, _p2p_ops
 from megatron.core.pipeline_parallel.pipeline_payload import (
@@ -93,7 +94,8 @@ class _P2PWork:
             self._progress()
             self._progress = None
         for request in self._requests:
-            request.wait()
+            with forward_range("communication.pp_wait"):
+                request.wait()
         self._requests.clear()
         self._buffers.clear()
         self._pending.pop(self, None)
@@ -334,6 +336,7 @@ class TypedP2PCommunicator(P2PCommunicator):
         if output is not None and getattr(self.config, "deallocate_pipeline_outputs", False):
             output.release_output()
 
+    @host_scope("communication.pp.typed")
     def _exchange(
         self,
         *,

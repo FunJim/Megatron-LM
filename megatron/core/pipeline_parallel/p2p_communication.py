@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 
+from megatron.core.component_nvtx import host_scope
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.utils import nvtx_decorator
@@ -272,6 +273,7 @@ class P2PCommunicator:
 
         return recv_prev_shape, recv_next_shape
 
+    @host_scope("communication.pp")
     def _communicate(
         self,
         *,

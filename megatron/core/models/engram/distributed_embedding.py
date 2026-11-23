@@ -10,6 +10,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.component_nvtx import (
+    capture_execution,
+    component,
+    execution_phase,
+    forward_range,
+)
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
@@ -35,12 +41,14 @@ class _DifferentiableEngramAllToAll(torch.autograd.Function):
         ctx.group = group
         ctx.output_splits = output_splits
         ctx.input_splits = input_splits
+        ctx.profile_execution = capture_execution()
         message = "engram.lookup.return-a2a.forward"
         nvtx_range_push(message)
         try:
-            return _DifferentiableEngramAllToAll._exchange(
-                group, input_, output_splits, input_splits
-            )
+            with forward_range("communication.engram_return_a2a"):
+                return _DifferentiableEngramAllToAll._exchange(
+                    group, input_, output_splits, input_splits
+                )
         finally:
             nvtx_range_pop(message)
 
@@ -49,9 +57,11 @@ class _DifferentiableEngramAllToAll(torch.autograd.Function):
         message = "engram.lookup.return-a2a.backward"
         nvtx_range_push(message)
         try:
-            grad_input = _DifferentiableEngramAllToAll._exchange(
-                ctx.group, grad_output, ctx.input_splits, ctx.output_splits
-            )
+            with execution_phase("backward", ctx.profile_execution):
+                with forward_range("communication.engram_return_a2a"):
+                    grad_input = _DifferentiableEngramAllToAll._exchange(
+                        ctx.group, grad_output, ctx.input_splits, ctx.output_splits
+                    )
         finally:
             nvtx_range_pop(message)
         return None, grad_input, None, None
@@ -296,6 +306,7 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             )
         return sharded_state_dict
 
+    @component("engram.owner_lookup")
     def _lookup_received_requests(self, requests: Tensor, table_counts: list[int]) -> Tensor:
         """Look up owner-local rows, grouping the received requests by table.
 
@@ -379,10 +390,12 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         message = "engram.lookup.count-a2a"
         nvtx_range_push(message)
         try:
-            torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
+            with forward_range("communication.engram_count_a2a"):
+                torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
         finally:
             nvtx_range_pop(message)
-        sent, received = torch.stack((send_counts, recv_counts)).tolist()
+        with forward_range("communication.engram_count_wait"):
+            sent, received = torch.stack((send_counts, recv_counts)).tolist()
         peer_slices = [
             slice(peer * num_tables, (peer + 1) * num_tables) for peer in range(self.ep_size)
         ]
@@ -397,13 +410,14 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         message = "engram.lookup.request-a2a"
         nvtx_range_push(message)
         try:
-            torch.distributed.all_to_all_single(
-                received_requests,
-                requests.contiguous(),
-                output_split_sizes=recv_splits,
-                input_split_sizes=send_splits,
-                group=self.ep_group,
-            )
+            with forward_range("communication.engram_request_a2a"):
+                torch.distributed.all_to_all_single(
+                    received_requests,
+                    requests.contiguous(),
+                    output_split_sizes=recv_splits,
+                    input_split_sizes=send_splits,
+                    group=self.ep_group,
+                )
         finally:
             nvtx_range_pop(message)
 

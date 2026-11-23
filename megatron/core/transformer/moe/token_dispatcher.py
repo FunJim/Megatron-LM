@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 import torch
 
 from megatron.core import utils
+from megatron.core.component_nvtx import forward_range
 from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
@@ -984,7 +985,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
             if point == self.cuda_sync_point:
                 # Synchronize with the DtoH stream at self.cuda_sync_point.
-                self.d2h_event.synchronize()
+                with forward_range("communication.moe_count_wait"):
+                    self.d2h_event.synchronize()
 
         return tokens_per_expert
 
