@@ -190,10 +190,74 @@ class ComponentNvtxTests(unittest.TestCase):
         )
         self.assertFalse(any("mb=8" in name for name in names))
 
+    def test_schedule_preserves_microbatch_ids_through_wrapped_hybrid_checkpoint(self):
+        from megatron.core.pipeline_parallel import schedules
+
+        nvtx = self.nvtx
+        layer = nvtx.component("fixture")(torch.square)
+        groups = SimpleNamespace(
+            **{key: SimpleNamespace(rank=lambda: 0) for key in ("pp", "cp", "dp")}
+        )
+        stack = SimpleNamespace(layers=[SimpleNamespace()], pg_collection=groups)
+        # Bridge exposes the Hybrid decoder under language_model, after .module unwrapping.
+        wrapped = SimpleNamespace(
+            module=SimpleNamespace(
+                language_model=SimpleNamespace(decoder=stack), set_input_tensor=lambda _: None
+            )
+        )
+
+        @nvtx.microbatch_scope
+        def run(stack, x):
+            return checkpoint(nvtx.checkpoint_forward(layer), x, use_reentrant=True)
+
+        def forward(data_iterator, model):
+            return run(model.module.language_model.decoder, next(data_iterator)), None
+
+        nvtx.set_capture_context(True, 12)
+        inputs = [torch.ones(4, requires_grad=True) for _ in range(2)]
+        outputs = []
+        with patch.object(schedules, "component_nvtx", nvtx):
+            for mb, x in zip((0, 7), inputs):
+                out, _ = schedules.forward_step(
+                    forward,
+                    iter([x]),
+                    wrapped,
+                    8,
+                    None,
+                    [],
+                    SimpleNamespace(timers=None, enable_autocast=False),
+                    cp_group_size=1,
+                    current_microbatch=mb,
+                    is_last_stage=False,
+                )
+                outputs.append(out)
+                self.assertIsNone(nvtx.capture_execution().mb)
+
+        for out, x in zip(outputs, inputs):
+            out.sum().backward()
+            torch.testing.assert_close(x.grad, 2 * x)
+
+        for kind, prefix, phase in (
+            ("push", "microbatch:", "forward"),
+            ("push", "comp:fixture:", "recompute"),
+            ("start", "microbatch.bwd:", "backward"),
+        ):
+            with self.subTest(phase=phase):
+                tags = [
+                    name
+                    for event, name, _ in self.recorder.events
+                    if event == kind and name.startswith(prefix) and f":phase={phase}:" in name
+                ]
+                self.assertEqual(
+                    [tag.partition(":mb=")[2].split(":")[0] for tag in tags], ["0", "7"]
+                )
+
     def test_closed_capture_does_not_emit_components(self):
         fn = self.nvtx.component("test")(lambda x: x.sin())
         self.nvtx.set_capture_context(False)
-        fn(torch.ones(4, requires_grad=True)).sum().backward()
+        with self.nvtx.scheduled_microbatch(7):
+            self.assertIsNone(self.nvtx.capture_execution().mb)
+            fn(torch.ones(4, requires_grad=True)).sum().backward()
         self.assertEqual(self.recorder.events, [])
 
     def test_host_scope_does_not_scan_or_hook_output_graph(self):

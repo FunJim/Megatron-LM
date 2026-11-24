@@ -55,6 +55,19 @@ def capture_execution() -> _Execution:
     return replace(state, step=_step) if state.step is None else state
 
 
+@contextmanager
+def scheduled_microbatch(microbatch_id: int | None) -> Iterator[None]:
+    """Carry the pipeline schedule's microbatch ID into the forward's NVTX ranges."""
+    if not _active or microbatch_id is None:
+        yield
+        return
+    token = _execution.set(replace(capture_execution(), mb=microbatch_id))
+    try:
+        yield
+    finally:
+        _execution.reset(token)
+
+
 def _name(prefix: str, state: _Execution) -> str:
     fields = [f"phase={state.phase}"]
     fields.extend(
@@ -222,9 +235,13 @@ def microbatch_scope(fn: Callable) -> Callable:
     def wrapper(stack, *args, **kwargs):
         if not _active:
             return fn(stack, *args, **kwargs)
+        state = capture_execution()
+        mb = state.mb
+        if mb is None and len(stack.layers):
+            mb = getattr(stack.layers[0], "current_microbatch", None)
         state = replace(
-            capture_execution(),
-            mb=getattr(stack.layers[0], "current_microbatch", None) if len(stack.layers) else None,
+            state,
+            mb=mb,
             **{
                 key: getattr(stack.pg_collection, key).rank()
                 for key in ("pp", "cp", "dp")
