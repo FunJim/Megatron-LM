@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.component_nvtx import component
+from megatron.core.component_nvtx import component, forward_range
 from megatron.core.transformer.mhc_chunked import (
     aggregate_chunk,
     bda_chunk,
@@ -521,10 +521,11 @@ class HyperConnectionModule(MegatronModule):
         if chunk_size and x.numel():
 
             def mappings(hidden, weight, alpha_pre, alpha_post, alpha_res, bias):
-                hidden = hidden.float()
-                inv_rms = torch.rsqrt(hidden.square().mean(-1, keepdim=True) + self.norm_eps)
-                with torch.autocast(device_type=hidden.device.type, enabled=False):
-                    mixes = F.linear(hidden, weight.float()) * inv_rms
+                with forward_range("mhc.native_projection_rms"):
+                    hidden = hidden.float()
+                    inv_rms = torch.rsqrt(hidden.square().mean(-1, keepdim=True) + self.norm_eps)
+                    with torch.autocast(device_type=hidden.device.type, enabled=False):
+                        mixes = F.linear(hidden, weight.float()) * inv_rms
                 h_pre = (
                     mixes[..., : self.n] * alpha_pre.float() + bias[: self.n].float()
                 ).sigmoid() + self.compute_h_eps
@@ -535,11 +536,9 @@ class HyperConnectionModule(MegatronModule):
                 h_res = (
                     mixes[..., 2 * self.n :] * alpha_res.float() + bias[2 * self.n :].float()
                 ).unflatten(-1, (self.n, self.n))
-                return (
-                    h_pre,
-                    h_post,
-                    _sinkhorn_iterations_native(h_res, self.sinkhorn_iterations, self.sinkhorn_eps),
-                )
+                with forward_range("mhc.native_sinkhorn"):
+                    h_res = _sinkhorn_iterations_native(h_res, self.sinkhorn_iterations, self.sinkhorn_eps)
+                return h_pre, h_post, h_res
 
             return chunked_mhc(
                 mappings,
@@ -552,10 +551,11 @@ class HyperConnectionModule(MegatronModule):
                 self.alpha_res,
                 self.bias,
             )
-        x_fp32 = x.float()
-        inv_rms = torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + self.norm_eps)
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            mixes = F.linear(x_fp32, self.mapping_proj.weight.float()) * inv_rms
+        with forward_range("mhc.native_projection_rms"):
+            x_fp32 = x.float()
+            inv_rms = torch.rsqrt(x_fp32.square().mean(-1, keepdim=True) + self.norm_eps)
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                mixes = F.linear(x_fp32, self.mapping_proj.weight.float()) * inv_rms
         h_pre = (
             mixes[..., : self.n] * self.alpha_pre.float() + self.bias[: self.n].float()
         ).sigmoid() + self.compute_h_eps
@@ -566,7 +566,8 @@ class HyperConnectionModule(MegatronModule):
         h_res = (
             mixes[..., 2 * self.n :] * self.alpha_res.float() + self.bias[2 * self.n :].float()
         ).unflatten(-1, (self.n, self.n))
-        h_res = _sinkhorn_iterations_native(h_res, self.sinkhorn_iterations, self.sinkhorn_eps)
+        with forward_range("mhc.native_sinkhorn"):
+            h_res = _sinkhorn_iterations_native(h_res, self.sinkhorn_iterations, self.sinkhorn_eps)
         return h_pre, h_post, h_res
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)

@@ -14,6 +14,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     fused_mla_rope_out_of_place,
 )
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.component_nvtx import capture_execution, execution_phase, forward_range, backward_scope
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (
@@ -744,6 +745,7 @@ class _ChunkedSparseAttention(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, query, kv, sink, indices, scale, chunk_size):
+        ctx.nvtx_execution = capture_execution()
         ctx.save_for_backward(query, kv, sink, indices)
         ctx.scale = scale
         ctx.chunk_size = chunk_size
@@ -768,8 +770,11 @@ class _ChunkedSparseAttention(torch.autograd.Function):
                 q = query[start:end].detach().requires_grad_()
                 k = kv.detach().requires_grad_()
                 s = sink.detach().requires_grad_()
-                output = _unfused_compressed_sparse_attn(q, k, s, indices[start:end], ctx.scale)
-                dq, dk, ds = torch.autograd.grad(output, (q, k, s), grad_output[start:end])
+                with execution_phase("backward_recompute", ctx.nvtx_execution):
+                    with forward_range("attention.native_chunk_recompute"):
+                        output = _unfused_compressed_sparse_attn(q, k, s, indices[start:end], ctx.scale)
+                with backward_scope(output), forward_range("attention.native_chunk_autograd"):
+                    dq, dk, ds = torch.autograd.grad(output, (q, k, s), grad_output[start:end])
             query_grad[start:end] = dq
             kv_grad.add_(dk.float())
             sink_grad.add_(ds.float())

@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.autograd.function import once_differentiable
 
+from megatron.core.component_nvtx import capture_execution, execution_phase, backward_scope
+
 
 def token_chunk_size() -> int:
     """Read the opt-in maximum number of tokens per native mHC operation."""
@@ -24,6 +26,7 @@ class _ChunkedMHC(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, function, chunk_size, token_args, *args):
+        ctx.nvtx_execution = capture_execution()
         ctx.function = function
         ctx.chunk_size = chunk_size
         ctx.token_args = token_args
@@ -81,17 +84,19 @@ class _ChunkedMHC(torch.autograd.Function):
                 for i, v in enumerate(flat)
             ]
             with torch.enable_grad():
-                values = ctx.function(*inputs)
+                with execution_phase("backward_recompute", ctx.nvtx_execution):
+                    values = ctx.function(*inputs)
                 active_outputs = [
                     (v, g[start:end]) for v, g in zip(values, outputs) if g is not None
                 ]
                 active_inputs = [v for i, v in enumerate(inputs) if needed[i]]
-                grads = torch.autograd.grad(
-                    [v for v, _ in active_outputs],
-                    active_inputs,
-                    [g for _, g in active_outputs],
-                    allow_unused=True,
-                )
+                with backward_scope([v for v, _ in active_outputs]):
+                    grads = torch.autograd.grad(
+                        [v for v, _ in active_outputs],
+                        active_inputs,
+                        [g for _, g in active_outputs],
+                        allow_unused=True,
+                    )
             for i, grad in zip((i for i in range(len(args)) if needed[i]), grads):
                 if i < ctx.token_args:
                     if grad is None:

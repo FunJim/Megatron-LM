@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from megatron.core.component_nvtx import component, forward_range
+from megatron.core.component_nvtx import component, forward_range, host_scope
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -831,6 +831,7 @@ class CSA2Indexer(MegatronModule):
         weights, _ = self.linear_weights_proj(x)
         return q, indexer_k, weights
 
+    @host_scope("indexer.score")
     def _score_projected(
         self,
         q: torch.Tensor,
@@ -919,6 +920,7 @@ class CSA2Indexer(MegatronModule):
             compressed_layout=compressed_layout,
         )
 
+    @host_scope("indexer.selection.stable_topk")
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
         chunk_size = getattr(self.config, "csa_query_chunk_size", 0)

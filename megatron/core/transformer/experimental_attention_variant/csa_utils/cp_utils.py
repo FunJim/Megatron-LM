@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from megatron.core.component_nvtx import forward_range
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_emb_bshd
 
@@ -158,8 +159,11 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                     dist.isend, send_tail, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
                 )
             )
-        for req in dist.batch_isend_irecv(ops):
-            req.wait()
+        with forward_range("communication.cp_halo.post"):
+            requests = dist.batch_isend_irecv(ops)
+        with forward_range("communication.cp_halo.wait"):
+            for req in requests:
+                req.wait()
         return boundary
 
     @staticmethod
@@ -186,8 +190,11 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                     dist.irecv, recv_grad, dist.get_global_rank(cp_group, cp_rank + 1), cp_group
                 )
             )
-        for req in dist.batch_isend_irecv(ops):
-            req.wait()
+        with forward_range("communication.cp_halo.backward_post"):
+            requests = dist.batch_isend_irecv(ops)
+        with forward_range("communication.cp_halo.backward_wait"):
+            for req in requests:
+                req.wait()
         if cp_rank + 1 < cp_size:
             grad_input[-d_window:] = recv_grad
         return grad_input, None, None

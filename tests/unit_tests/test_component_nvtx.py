@@ -191,9 +191,16 @@ class ComponentNvtxTests(unittest.TestCase):
         self.assertFalse(any("mb=8" in name for name in names))
 
     def test_schedule_preserves_microbatch_ids_through_wrapped_hybrid_checkpoint(self):
-        from megatron.core.pipeline_parallel import schedules
+        from megatron.core.pipeline_parallel import schedules as installed_schedules
 
         nvtx = self.nvtx
+        path = ROOT / "megatron/core/pipeline_parallel/schedules.py"
+        tree = ast.parse(path.read_text())
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("forward_step", "set_current_microbatch")]
+        namespace = {**vars(installed_schedules), "component_nvtx": nvtx}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        schedules = SimpleNamespace(**namespace)
         layer = nvtx.component("fixture")(torch.square)
         groups = SimpleNamespace(
             **{key: SimpleNamespace(rank=lambda: 0) for key in ("pp", "cp", "dp")}
@@ -387,7 +394,9 @@ class ComponentNvtxTests(unittest.TestCase):
             for node in tree.body
             if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted
         ]
-        namespace = {"torch": torch, "F": torch.nn.functional}
+        namespace = {"torch": torch, "F": torch.nn.functional,
+                     **{name: getattr(self.nvtx, name) for name in
+                        ("capture_execution", "execution_phase", "forward_range", "backward_scope")}}
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
         torch.manual_seed(27)
         q = torch.randn(9, 2, 4, requires_grad=True)

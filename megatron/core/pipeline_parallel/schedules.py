@@ -245,15 +245,16 @@ def custom_backward(output, grad_output):
         grad_output = torch.ones_like(output, memory_format=torch.preserve_format)
 
     # Call c++ engine [ see torch/csrc/autograd/python_engine.cpp ]
-    Variable._execution_engine.run_backward(
-        tensors=(output,),
-        grad_tensors=(grad_output,),
-        keep_graph=False,
-        create_graph=False,
-        inputs=tuple(),
-        allow_unreachable=True,
-        accumulate_grad=True,
-    )
+    with component_nvtx.backward_scope(output):
+        Variable._execution_engine.run_backward(
+            tensors=(output,),
+            grad_tensors=(grad_output,),
+            keep_graph=False,
+            create_graph=False,
+            inputs=tuple(),
+            allow_unreachable=True,
+            accumulate_grad=True,
+        )
 
 
 def get_tensor_device(tensor: Union[torch.Tensor, PipelinePayload, Dict[str, torch.Tensor]]):
@@ -614,7 +615,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, config):
         if config.deallocate_pipeline_outputs:
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            with component_nvtx.backward_scope(output_tensor[0]):
+                torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -687,9 +689,10 @@ def backward_step_multimodule(
             if config.deallocate_pipeline_outputs:
                 custom_backward(output_tensor_module, output_tensor_grad_module)
             else:
-                torch.autograd.backward(
-                    output_tensor_module, grad_tensors=output_tensor_grad_module
-                )
+                with component_nvtx.backward_scope(output_tensor_module):
+                    torch.autograd.backward(
+                        output_tensor_module, grad_tensors=output_tensor_grad_module
+                    )
 
     # Collect gradients for input tensors.
     input_tensor_grad = {}

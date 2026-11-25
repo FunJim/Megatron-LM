@@ -93,8 +93,8 @@ class _P2PWork:
         if self._progress is not None:
             self._progress()
             self._progress = None
-        for request in self._requests:
-            with forward_range("communication.pp_wait"):
+        with forward_range("communication.pp_wait"):
+            for request in self._requests:
                 request.wait()
         self._requests.clear()
         self._buffers.clear()
@@ -250,7 +250,8 @@ class TypedP2PCommunicator(P2PCommunicator):
         for handle in handles.values():
             handle.wait()
         if ops and self.config.batch_p2p_sync and self.device.type == "cuda":
-            torch.cuda.synchronize()
+            with forward_range("communication.pp_device_sync"):
+                torch.cuda.synchronize()
 
     def _gradient_tensors(self, gradients, specs):
         if len(gradients) != len(specs):
@@ -272,6 +273,7 @@ class TypedP2PCommunicator(P2PCommunicator):
             tensors.append(grad)
         return tensors
 
+    @host_scope("communication.pp_header_decode")
     def _make_received_payload(self, header, chunk_id, microbatch):
         specs, metadata = _unpack_header(header.tolist(), microbatch, chunk_id)
         return self._allocate_payload(PipelinePayloadSpec(specs, metadata), chunk_id)
@@ -470,19 +472,21 @@ class TypedP2PCommunicator(P2PCommunicator):
                     handles["recv_prev"] = received
                 return received, backward_tensors if recv_backward else None, handles
 
-            self._transfer(send_next=headers, recv_prev=[header] if recv_forward else None)
+            with forward_range("communication.pp_header_transfer"):
+                self._transfer(send_next=headers, recv_prev=[header] if recv_forward else None)
             payload, forward_tensors = None, None
             if recv_forward:
                 payload, forward_tensors = self._make_received_payload(
                     header, forward_recv_chunk_id, microbatch
                 )
-            handles = self._transfer(
-                send_next=forward_sends,
-                send_prev=backward_sends,
-                recv_prev=forward_tensors if recv_forward else None,
-                recv_next=backward_tensors if recv_backward else None,
-                overlap=overlap,
-            )
+            with forward_range("communication.pp_data_transfer"):
+                handles = self._transfer(
+                    send_next=forward_sends,
+                    send_prev=backward_sends,
+                    recv_prev=forward_tensors if recv_forward else None,
+                    recv_next=backward_tensors if recv_backward else None,
+                    overlap=overlap,
+                )
             self._release_sent_output(output)
             result = payload, backward_tensors if recv_backward else None
             return (*result, handles) if overlap else result
