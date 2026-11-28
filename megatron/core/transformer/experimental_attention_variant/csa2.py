@@ -20,6 +20,9 @@ import torch.nn.functional as F
 from torch import nn
 
 from megatron.core.component_nvtx import component, forward_range, host_scope
+from megatron.core.fusions.fused_csa2_indexer import (
+    indexer_fusion_enabled, indexer_sort_rows, relu_weight_sum,
+)
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -848,6 +851,7 @@ class CSA2Indexer(MegatronModule):
                 k.shape[0], thd_layout=thd_layout, compressed_layout=compressed_layout
             )
         scaled_weights = weights.float() * (self.head_dim**-0.5 * self.n_heads**-0.5)
+        optimize = indexer_fusion_enabled() and not torch.is_grad_enabled()
         if thd_layout is not None:
             chunk_size = getattr(self.config, 'csa_query_chunk_size', 0)
             if chunk_size > 0 and not torch.is_grad_enabled():
@@ -855,9 +859,16 @@ class CSA2Indexer(MegatronModule):
                 k_float = k.float()
                 for start in range(0, q.shape[0], chunk_size):
                     end = min(start + chunk_size, q.shape[0])
-                    chunk = torch.einsum("thd,cd->thc", q[start:end].float(), k_float).relu()
-                    scores[start:end] = (chunk * scaled_weights[start:end].unsqueeze(-1)).sum(dim=1)
+                    if optimize:
+                        chunk = torch.einsum("thd,cd->thc", q[start:end].float(), k_float)
+                        scores[start:end] = relu_weight_sum(chunk, scaled_weights[start:end], 1)
+                    else:
+                        chunk = torch.einsum("thd,cd->thc", q[start:end].float(), k_float).relu()
+                        scores[start:end] = (chunk * scaled_weights[start:end].unsqueeze(-1)).sum(dim=1)
                     del chunk
+            elif optimize:
+                scores = torch.einsum("thd,cd->thc", q.float(), k.float())
+                scores = relu_weight_sum(scores, scaled_weights, 1)
             else:
                 scores = torch.einsum("thd,cd->thc", q.float(), k.float()).relu()
                 scores = (scores * scaled_weights.unsqueeze(-1)).sum(dim=1)
@@ -873,8 +884,12 @@ class CSA2Indexer(MegatronModule):
             if candidates is not None:
                 valid = valid & candidates
             return scores.masked_fill(~valid, -torch.inf)
-        scores = torch.einsum("sbhd,tbd->bsht", q.float(), k.float()).relu()
-        scores = (scores * scaled_weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
+        if optimize:
+            scores = torch.einsum("sbhd,tbd->bsht", q.float(), k.float())
+            scores = relu_weight_sum(scores, scaled_weights.permute(1, 0, 2), 2)
+        else:
+            scores = torch.einsum("sbhd,tbd->bsht", q.float(), k.float()).relu()
+            scores = (scores * scaled_weights.permute(1, 0, 2).unsqueeze(-1)).sum(dim=2)
         visible = torch.arange(1, q.shape[0] + 1, device=q.device) // self.compress_ratio
         causal = torch.arange(k.shape[0], device=q.device)[None, :] < visible[:, None]
         scores = scores.masked_fill(~causal, -torch.inf)
@@ -923,7 +938,7 @@ class CSA2Indexer(MegatronModule):
     @host_scope("indexer.selection.stable_topk")
     def select_indices(self, scores: torch.Tensor) -> torch.Tensor:
         """Return sorted logical positions, with -1 for masked or unavailable entries."""
-        chunk_size = getattr(self.config, "csa_query_chunk_size", 0)
+        chunk_size = indexer_sort_rows(getattr(self.config, "csa_query_chunk_size", 0))
         width = min(self.topk, scores.shape[-1])
         if scores.numel() and chunk_size > 0:
             rows = scores.reshape(-1, scores.shape[-1])
@@ -965,6 +980,7 @@ class CSA2Indexer(MegatronModule):
     ) -> tuple[torch.Tensor, CSA2CandidateBlocks | None]:
         """Select native THD rows without retaining the full query/key score matrix."""
         chunk_size = self.config.csa_query_chunk_size
+        score_keys = k.float() if indexer_fusion_enabled() else k
         indices = torch.empty(
             (q.shape[0], min(self.topk, k.shape[0])), dtype=torch.int32, device=q.device
         )
@@ -989,7 +1005,7 @@ class CSA2Indexer(MegatronModule):
                 chunk_candidates = candidates[start:end]
             scores = self._score_projected(
                 q[start:end],
-                k,
+                score_keys,
                 weights[start:end],
                 candidates=chunk_candidates,
                 thd_layout=layout,
